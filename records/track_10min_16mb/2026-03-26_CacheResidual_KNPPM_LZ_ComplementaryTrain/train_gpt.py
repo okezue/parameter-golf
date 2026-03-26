@@ -1208,7 +1208,7 @@ class GPT(nn.Module):
         ve_base = ve_cache['ve'] if ve_cache is not None else self.ve_shared(input_ids)
         ve_idx = self.ve_layer_indices.index(layer_idx)
         return ve_base * self.ve_layer_scales[ve_idx].to(dtype=ve_base.dtype)
-    def forward(self, input_ids: Tensor, target_ids: Tensor, surrogate: SurrogateCache | None = None, comp_alpha: float = 0.0) -> Tensor:
+    def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
         n = self.num_layers
         x = self.tok_emb(input_ids)
         if self.bigram is not None:
@@ -1247,19 +1247,7 @@ class GPT(nn.Module):
                 raise RuntimeError("lm_head is required when tie_embeddings=False")
             logits_proj = self.lm_head(x_flat)
         logits = self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
-        if self.training and surrogate is not None and comp_alpha > 0.0:
-            p_neural = F.softmax(logits.float(), dim=-1)
-            prev_flat = input_ids.reshape(-1)
-            bi_row = surrogate.bi_counts[prev_flat]
-            bi_row_sum = surrogate.bi_totals[prev_flat].clamp_min(1.0).unsqueeze(-1)
-            p_cache_full = (bi_row / bi_row_sum).clamp_min(1e-8)
-            p_cache_full = p_cache_full / p_cache_full.sum(dim=-1, keepdim=True)
-            alpha_per_tok = (comp_alpha * surrogate.confidence(prev_flat)).unsqueeze(-1)
-            p_mix = (1.0 - alpha_per_tok) * p_neural + alpha_per_tok * p_cache_full
-            p_mix = p_mix.clamp_min(1e-10)
-            main_loss = F.nll_loss(torch.log(p_mix), targets, reduction="mean")
-        else:
-            main_loss = F.cross_entropy(logits.float(), targets, reduction="mean")
+        main_loss = F.cross_entropy(logits.float(), targets, reduction="mean")
         if self.training and self.mtp_num_heads > 0 and self.mtp_loss_weight > 0.0:
             _, seqlen, dim = x.shape
             mtp_loss_sum = x.new_zeros(())
@@ -2508,7 +2496,23 @@ def main() -> None:
         for micro_step in range(grad_accum_steps):
             x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                loss = model(x, y, surrogate=surr_cache, comp_alpha=comp_alpha_cur)
+                loss = model(x, y)
+            if surr_cache is not None and comp_alpha_cur > 0.0:
+                with torch.no_grad():
+                    logits_det = base_model.forward_logits(x).detach()
+                    logits_sc = base_model.logit_softcap * torch.tanh(logits_det / base_model.logit_softcap)
+                    p_n = F.softmax(logits_sc.float().reshape(-1, args.vocab_size), dim=-1)
+                    pf = x.reshape(-1)
+                    br = surr_cache.bi_counts[pf]
+                    bs = surr_cache.bi_totals[pf].clamp_min(1.0).unsqueeze(-1)
+                    p_c = (br / bs).clamp_min(1e-8)
+                    p_c = p_c / p_c.sum(dim=-1, keepdim=True)
+                    al = (comp_alpha_cur * surr_cache.confidence(pf)).unsqueeze(-1)
+                    p_m = (1.0 - al) * p_n + al * p_c
+                    tgt = y.reshape(-1)
+                    w = -torch.log(p_m.clamp_min(1e-10).gather(1, tgt.unsqueeze(1)).squeeze(1))
+                    w = (w / w.mean()).clamp(0.5, 2.0).detach()
+                loss = (F.cross_entropy(logits_sc.reshape(-1, args.vocab_size).float(), y.reshape(-1), reduction='none') * w).mean()
             train_loss += loss.detach()
             (loss * grad_scale).backward()
             if surr_cache is not None:
