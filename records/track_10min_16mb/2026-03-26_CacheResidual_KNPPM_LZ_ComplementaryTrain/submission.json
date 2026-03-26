@@ -1,0 +1,12 @@
+{
+  "name": "Okezue Bell",
+  "github_id": "okezuebell",
+  "val_bpb": null,
+  "date": "2026-03-26",
+  "summary": "Cache-Residual Compressor: Complementary Training + KN/PPM + LZ77 + AdaHedge Expert Mixing + Cache-Aware TTT on LeakyReLU/ParallelMuon/GPTQ-lite stack",
+  "base_pr": "#549",
+  "train_time_seconds": 600,
+  "eval_time_seconds": 600,
+  "artifact_bytes": null,
+  "hardware": "8xH100 SXM"
+}
