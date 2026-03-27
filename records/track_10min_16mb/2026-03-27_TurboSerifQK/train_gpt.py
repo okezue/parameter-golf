@@ -1348,13 +1348,14 @@ class CompressedLinearQK(nn.Module):
         B, T, D = x.shape
         R, ng = self.zi.shape
         G = self.cb.shape[1]
+        dt = x.dtype
         x_g = x.reshape(B, T, ng, G)
-        P = torch.einsum('btng,kg->btnk', x_g, self.cb.to(x.dtype))
+        P = torch.einsum('btng,kg->btnk', x_g, self.cb.to(dt))
         gathered = torch.stack([P[:, :, g, self.zi[:, g]] for g in range(ng)], dim=-1)
-        coarse = self.scales.to(x.dtype).unsqueeze(0).unsqueeze(0) * gathered
-        u = torch.einsum('hg,btng->btnh', self.H.to(x.dtype), x_g)
-        corr = self.beta.to(x.dtype) * torch.einsum('btnh,rnh->btnr', u, self.sk.to(x.dtype))
-        return (coarse + corr.permute(0, 1, 3, 2)).sum(dim=-1)
+        coarse = self.scales.to(dt).unsqueeze(0).unsqueeze(0) * gathered
+        u = torch.einsum('hg,btng->btnh', self.H.to(dt), x_g)
+        corr = self.beta.to(dt) * torch.einsum('btnh,rnh->btnr', u, self.sk.to(dt))
+        return (coarse + corr.permute(0, 1, 3, 2)).sum(dim=-1).to(dt)
 
 def _ts_decode_full(enc, gt_np, H_np, beta):
     R, ng = enc['zi'].shape
