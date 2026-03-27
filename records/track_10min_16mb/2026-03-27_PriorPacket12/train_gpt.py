@@ -54,11 +54,11 @@ class Hyperparameters:
     max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 600.0))
     qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 1.5))
     vocab_size = int(os.environ.get("VOCAB_SIZE", 1024))
-    num_layers = int(os.environ.get("NUM_LAYERS", 7))
+    num_layers = int(os.environ.get("NUM_LAYERS", 11))
     num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 4))
-    model_dim = int(os.environ.get("MODEL_DIM", 448))
+    model_dim = int(os.environ.get("MODEL_DIM", 512))
     num_heads = int(os.environ.get("NUM_HEADS", 8))
-    mlp_mult = float(os.environ.get("MLP_MULT", 2.5))
+    mlp_mult = float(os.environ.get("MLP_MULT", 3.0))
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
@@ -84,7 +84,7 @@ class Hyperparameters:
     qat_enabled = bool(int(os.environ.get("QAT_ENABLED", "0")))
     bigram_vocab_size = int(os.environ.get("BIGRAM_VOCAB_SIZE", 1024))
     bigram_dim = int(os.environ.get("BIGRAM_DIM", 64))
-    xsa_last_n = int(os.environ.get("XSA_LAST_N", 2))
+    xsa_last_n = int(os.environ.get("XSA_LAST_N", 4))
     rope_dims = int(os.environ.get("ROPE_DIMS", 16))
     ln_scale = bool(int(os.environ.get("LN_SCALE", "1")))
     late_qat_threshold = float(os.environ.get("LATE_QAT_THRESHOLD", 0.15))
@@ -242,99 +242,96 @@ def _fnv(toks, mask):
     return int(h & np.uint64(mask))
 
 class PosteriorPacketBuilder:
-    def __init__(self, V, max_order=12, dense_buckets=65536, top_conts=4):
+    def __init__(self, V, max_order=5, table_bits=18):
         self.V = V
         self.max_order = max_order
-        self.dense_buckets = dense_buckets
-        self.top_conts = top_conts
-        self.dmask = dense_buckets - 1
-        self.bi = np.zeros((V, V), dtype=np.float32)
-        self.bi_tot = np.zeros(V, dtype=np.float32)
-        self.dense_counts = {}
-        for o in range(3, 6):
-            self.dense_counts[o] = np.zeros((dense_buckets, V), dtype=np.float32)
-            self.dense_counts[f'{o}_tot'] = np.zeros(dense_buckets, dtype=np.float32)
-        self.sparse = {}
+        self.T = 1 << table_bits
+        self.mask = self.T - 1
+        self.bi = np.zeros((V, V), dtype=np.float64)
+        self.bi_tot = np.zeros(V, dtype=np.float64)
+        self.tri_counts = np.zeros((self.T, V), dtype=np.float32)
+        self.tri_tot = np.zeros(self.T, dtype=np.float32)
+        self.quad_counts = np.zeros((self.T, V), dtype=np.float32)
+        self.quad_tot = np.zeros(self.T, dtype=np.float32)
+        self.n_tokens = 0
     def update(self, toks):
         toks = np.asarray(toks, dtype=np.int32)
         n = len(toks)
+        self.n_tokens += n
         for i in range(1, n):
             p, c = int(toks[i-1]), int(toks[i])
             self.bi[p, c] += 1.0
             self.bi_tot[p] += 1.0
-        for o in range(3, min(self.max_order + 1, n + 1)):
-            if o <= 5:
-                for i in range(o - 1, n):
-                    ctx = toks[i-o+1:i]
-                    h = _fnv(ctx, self.dmask)
-                    self.dense_counts[o][h, int(toks[i])] += 1.0
-                    self.dense_counts[f'{o}_tot'][h] += 1.0
-            else:
-                for i in range(o - 1, n):
-                    ctx = tuple(toks[i-o+1:i].tolist())
-                    tok = int(toks[i])
-                    if ctx not in self.sparse:
-                        self.sparse[ctx] = {}
-                    self.sparse[ctx][tok] = self.sparse[ctx].get(tok, 0) + 1
-    def build_packets(self, top_conts=4):
-        packets = {}
+        for i in range(2, n):
+            h = _fnv(toks[i-2:i], self.mask)
+            self.tri_counts[h, int(toks[i])] += 1.0
+            self.tri_tot[h] += 1.0
+        for i in range(3, n):
+            h = _fnv(toks[i-3:i], self.mask)
+            self.quad_counts[h, int(toks[i])] += 1.0
+            self.quad_tot[h] += 1.0
+    def build_store_tensors(self):
+        bi_prior = np.zeros((self.V, self.V), dtype=np.float32)
+        bi_tau = np.zeros(self.V, dtype=np.float32)
         for p in range(self.V):
-            if self.bi_tot[p] < 1:
-                continue
-            row = self.bi[p]
             tot = self.bi_tot[p]
-            top_ids = np.argsort(-row)[:top_conts]
-            top_probs = row[top_ids] / tot
-            tau = min(tot / 10.0, 50.0)
-            packets[(p,)] = {
-                'ids': top_ids.astype(np.int16),
-                'probs': np.clip(top_probs, 1e-6, 1.0).astype(np.float16),
-                'tau': np.float16(tau),
-                'order': 2,
-            }
-        for o in range(3, 6):
-            counts = self.dense_counts[o]
-            tots = self.dense_counts[f'{o}_tot']
-            for h in range(self.dense_buckets):
-                if tots[h] < 2:
-                    continue
-                row = counts[h]
-                top_ids = np.argsort(-row)[:top_conts]
-                top_probs = row[top_ids] / tots[h]
-                tau = min(tots[h] / 10.0, 50.0)
-                packets[('d', o, h)] = {
-                    'ids': top_ids.astype(np.int16),
-                    'probs': np.clip(top_probs, 1e-6, 1.0).astype(np.float16),
-                    'tau': np.float16(tau),
-                    'order': o,
-                }
-        for ctx, counts in self.sparse.items():
-            tot = sum(counts.values())
+            if tot < 1:
+                continue
+            bi_prior[p] = (self.bi[p] / tot).astype(np.float32)
+            bi_tau[p] = min(tot / 5.0, 100.0)
+        tri_top_ids = np.zeros((self.T, 4), dtype=np.int16)
+        tri_top_probs = np.zeros((self.T, 4), dtype=np.float16)
+        tri_tau = np.zeros(self.T, dtype=np.float16)
+        tri_active = 0
+        for h in range(self.T):
+            tot = self.tri_tot[h]
             if tot < 3:
                 continue
-            sorted_c = sorted(counts.items(), key=lambda x: -x[1])[:top_conts]
-            ids = np.array([c[0] for c in sorted_c], dtype=np.int16)
-            probs = np.array([c[1]/tot for c in sorted_c], dtype=np.float16)
-            tau = np.float16(min(tot / 10.0, 50.0))
-            packets[ctx] = {'ids': ids, 'probs': probs, 'tau': tau, 'order': len(ctx) + 1}
-        return packets
+            tri_active += 1
+            row = self.tri_counts[h]
+            top4 = np.argsort(-row)[:4]
+            tri_top_ids[h] = top4.astype(np.int16)
+            tri_top_probs[h] = (row[top4] / tot).astype(np.float16)
+            tri_tau[h] = np.float16(min(tot / 5.0, 100.0))
+        quad_top_ids = np.zeros((self.T, 4), dtype=np.int16)
+        quad_top_probs = np.zeros((self.T, 4), dtype=np.float16)
+        quad_tau = np.zeros(self.T, dtype=np.float16)
+        quad_active = 0
+        for h in range(self.T):
+            tot = self.quad_tot[h]
+            if tot < 3:
+                continue
+            quad_active += 1
+            row = self.quad_counts[h]
+            top4 = np.argsort(-row)[:4]
+            quad_top_ids[h] = top4.astype(np.int16)
+            quad_top_probs[h] = (row[top4] / tot).astype(np.float16)
+            quad_tau[h] = np.float16(min(tot / 5.0, 100.0))
+        return {
+            'bi_prior': torch.from_numpy(bi_prior),
+            'bi_tau': torch.from_numpy(bi_tau),
+            'tri_ids': torch.from_numpy(tri_top_ids),
+            'tri_probs': torch.from_numpy(tri_top_probs),
+            'tri_tau': torch.from_numpy(tri_tau),
+            'quad_ids': torch.from_numpy(quad_top_ids),
+            'quad_probs': torch.from_numpy(quad_top_probs),
+            'quad_tau': torch.from_numpy(quad_tau),
+            'table_mask': self.mask,
+        }, tri_active, quad_active
 
 class PriorPacketStore:
-    def __init__(self, V, packets, device):
+    def __init__(self, V, store_data, device):
         self.V = V
         self.device = device
-        self.bi_prior = torch.zeros(V, V, device=device, dtype=torch.float32)
-        self.bi_tau = torch.zeros(V, device=device, dtype=torch.float32)
-        for k, pkt in packets.items():
-            if isinstance(k, tuple) and len(k) == 1 and isinstance(k[0], int):
-                p = k[0]
-                ids = pkt['ids']
-                probs = pkt['probs'].astype(np.float32)
-                for j in range(len(ids)):
-                    self.bi_prior[p, int(ids[j])] = float(probs[j])
-                self.bi_tau[p] = float(pkt['tau'])
-        row_sums = self.bi_prior.sum(dim=1, keepdim=True).clamp_min(1e-8)
-        self.bi_prior = self.bi_prior / row_sums
+        self.bi_prior = store_data['bi_prior'].to(device=device, dtype=torch.float32)
+        self.bi_tau = store_data['bi_tau'].to(device=device, dtype=torch.float32)
+        self.tri_ids = store_data['tri_ids'].to(device=device, dtype=torch.long)
+        self.tri_probs = store_data['tri_probs'].to(device=device, dtype=torch.float32)
+        self.tri_tau = store_data['tri_tau'].to(device=device, dtype=torch.float32)
+        self.quad_ids = store_data['quad_ids'].to(device=device, dtype=torch.long)
+        self.quad_probs = store_data['quad_probs'].to(device=device, dtype=torch.float32)
+        self.quad_tau = store_data['quad_tau'].to(device=device, dtype=torch.float32)
+        self.mask = store_data['table_mask']
         self.online_bi = torch.zeros(V, V, device=device, dtype=torch.float32)
         self.online_bi_tot = torch.zeros(V, device=device, dtype=torch.float32)
     @torch.no_grad()
@@ -348,13 +345,31 @@ class PriorPacketStore:
         self.online_bi.view(-1).scatter_add_(0, idx, ones)
         self.online_bi_tot.scatter_add_(0, prev, ones)
     @torch.no_grad()
-    def predict(self, prev_ids):
-        tau = self.bi_tau[prev_ids].unsqueeze(-1)
+    def predict(self, prev_ids, prev2_ids=None, prev3_ids=None):
+        B = prev_ids.shape[0]
+        tau = self.bi_tau[prev_ids].unsqueeze(-1).clamp_min(0.1)
         prior = self.bi_prior[prev_ids]
         online = self.online_bi[prev_ids]
         online_tot = self.online_bi_tot[prev_ids].unsqueeze(-1)
-        posterior = (online + tau * prior) / (online_tot + tau).clamp_min(1e-8)
-        return posterior / posterior.sum(dim=-1, keepdim=True).clamp_min(1e-8)
+        p = (online + tau * prior) / (online_tot + tau).clamp_min(1e-8)
+        if prev2_ids is not None:
+            h2 = self._hash_pair(prev2_ids, prev_ids)
+            t2 = self.tri_tau[h2]
+            has_tri = t2 > 0
+            if has_tri.any():
+                ids2 = self.tri_ids[h2[has_tri]]
+                probs2 = self.tri_probs[h2[has_tri]]
+                tau2 = t2[has_tri].unsqueeze(-1)
+                tri_dist = torch.zeros(int(has_tri.sum()), self.V, device=self.device)
+                tri_dist.scatter_(1, ids2, probs2)
+                tri_dist = tri_dist / tri_dist.sum(-1, keepdim=True).clamp_min(1e-8)
+                p_tri = p[has_tri]
+                p[has_tri] = (p_tri * online_tot[has_tri].clamp_min(0.1) + tau2 * tri_dist) / (online_tot[has_tri].clamp_min(0.1) + tau2)
+        p = p / p.sum(-1, keepdim=True).clamp_min(1e-8)
+        return p
+    def _hash_pair(self, a, b):
+        h = a.long() * np.uint64(1099511628211) ^ b.long() * np.uint64(36313)
+        return (h % (self.mask + 1)).long()
 
 # --- Context-Only Expert Gate ---
 
@@ -838,9 +853,12 @@ def eval_val_packet(args, base_model, rank, world_size, device, val_tokens,
                     prev = x_b[i, s_off:wlen]
                     tgt = y_b[i, s_off:wlen]
                     pn = p_nn[i, s_off:wlen]
-                    pp = packet_store.predict(prev)
-                    has_prior = (packet_store.bi_tau[prev] > 0).float().unsqueeze(-1)
-                    a = alpha * has_prior
+                    prev2 = x_b[i, max(s_off-1,0):wlen-1] if s_off > 0 else None
+                    pp = packet_store.predict(prev, prev2_ids=prev2)
+                    tau_vals = packet_store.bi_tau[prev]
+                    online_tot = packet_store.online_bi_tot[prev]
+                    conf = torch.sigmoid((tau_vals + online_tot - 5.0) * 0.2)
+                    a = (alpha * conf).unsqueeze(-1)
                     pm = (1.0 - a) * pn + a * pp
                     pm = pm.clamp_min(1e-10)
                     nll = -torch.log(pm.gather(1, tgt.unsqueeze(1)).squeeze(1)).to(torch.float64)
@@ -924,22 +942,22 @@ def main():
     log0(f"val_bpb:enabled tokenizer_kind=sentencepiece tokenizer_path={args.tokenizer_path}")
     log0(f"train_loader:dataset:{dataset_dir.name} train_shards:{actual_train_files}")
     log0(f"val_loader:shards pattern={args.val_files} tokens:{val_tokens.numel() - 1}")
-    # --- Build posterior packets from training data ---
     log0("pp:building posterior packets from training data...")
-    pp_builder = PosteriorPacketBuilder(args.vocab_size, max_order=min(args.pp_max_order, 5),
-                                        dense_buckets=args.pp_dense_buckets, top_conts=args.pp_top_conts)
-    train_stream = TokenStream(args.train_files)
-    pp_tokens_seen = 0
-    pp_target = 20_000_000
-    while pp_tokens_seen < pp_target:
-        chunk = train_stream.take(min(100000, pp_target - pp_tokens_seen))
+    pp_builder = PosteriorPacketBuilder(args.vocab_size, max_order=5, table_bits=18)
+    train_stream_pp = TokenStream(args.train_files)
+    pp_seen = 0
+    pp_target = min(actual_train_files * 100_000_000, 500_000_000)
+    t_pp = time.perf_counter()
+    while pp_seen < pp_target:
+        chunk = train_stream_pp.take(min(500000, pp_target - pp_seen))
         pp_builder.update(chunk.numpy().astype(np.int32))
-        pp_tokens_seen += chunk.numel()
-    log0(f"pp:processed {pp_tokens_seen} training tokens")
-    packets = pp_builder.build_packets(top_conts=args.pp_top_conts)
-    log0(f"pp:built {len(packets)} packets")
-    packet_store = PriorPacketStore(args.vocab_size, packets, device)
-    log0(f"pp:store ready, bi_prior nonzero={int((packet_store.bi_tau > 0).sum().item())}")
+        pp_seen += chunk.numel()
+        if pp_seen % 10_000_000 < 500000:
+            log0(f"  pp:{pp_seen/1e6:.0f}M tokens processed ({time.perf_counter()-t_pp:.1f}s)")
+    store_data, tri_active, quad_active = pp_builder.build_store_tensors()
+    packet_store = PriorPacketStore(args.vocab_size, store_data, device)
+    log0(f"pp:done {pp_seen/1e6:.0f}M tokens, bi_active={int((store_data['bi_tau']>0).sum())}, "
+         f"tri_active={tri_active}, quad_active={quad_active}, time={time.perf_counter()-t_pp:.1f}s")
     # --- Build model ---
     base_model = GPT(
         vocab_size=args.vocab_size, num_layers=args.num_layers, model_dim=args.model_dim,
@@ -1139,9 +1157,8 @@ def main():
         quant_file_bytes = len(quant_blob)
         code_bytes = len(code.encode("utf-8"))
         log0(f"Serialized model int8+lzma: {quant_file_bytes} bytes")
-        # --- Serialize packets ---
         packet_buf = io.BytesIO()
-        torch.save({'bi_prior': packet_store.bi_prior.cpu(), 'bi_tau': packet_store.bi_tau.cpu()}, packet_buf)
+        torch.save(store_data, packet_buf)
         packet_raw = packet_buf.getvalue()
         packet_blob = lzma.compress(packet_raw, preset=6)
         with open("packets.ptz", "wb") as f:
@@ -1171,6 +1188,11 @@ def main():
              f"stride:{args.eval_stride} eval_time:{1000.0 * (time.perf_counter() - t_slide):.0f}ms")
         log0(f"final_sliding_exact val_loss:{sw_val_loss:.8f} val_bpb:{sw_val_bpb:.8f}")
     # --- PriorPacket eval ---
+    if master_process:
+        with open("packets.ptz", "rb") as f:
+            pkt_blob = f.read()
+        pkt_data = torch.load(io.BytesIO(lzma.decompress(pkt_blob)), map_location="cpu")
+        packet_store = PriorPacketStore(args.vocab_size, pkt_data, device)
     packet_store.online_bi.zero_()
     packet_store.online_bi_tot.zero_()
     torch.cuda.synchronize()
