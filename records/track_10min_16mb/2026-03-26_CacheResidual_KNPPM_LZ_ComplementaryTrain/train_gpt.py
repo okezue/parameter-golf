@@ -1533,7 +1533,35 @@ def eval_val_sliding_ttt(
     return val_loss, val_bpb
 
 
-# --- Cache-augmented sliding window eval ---
+# --- GPU Bigram Cache for Fast Cache-Augmented Eval ---
+
+class GPUBigramCache:
+    def __init__(self, V, device):
+        self.V = V
+        self.counts = torch.zeros(V, V, device=device, dtype=torch.float32)
+        self.totals = torch.zeros(V, device=device, dtype=torch.float32)
+    @torch.no_grad()
+    def update(self, tokens):
+        if tokens.numel() < 2:
+            return
+        prev = tokens[:-1].long()
+        curr = tokens[1:].long()
+        idx = prev * self.V + curr
+        ones = torch.ones(idx.numel(), device=self.counts.device, dtype=torch.float32)
+        self.counts.view(-1).scatter_add_(0, idx, ones)
+        self.totals.scatter_add_(0, prev, ones)
+    @torch.no_grad()
+    def predict(self, prev_ids, target_ids):
+        tot = self.totals[prev_ids].clamp_min(1.0)
+        cnt = self.counts[prev_ids, target_ids]
+        return cnt / tot
+    @torch.no_grad()
+    def predict_full(self, prev_ids):
+        rows = self.counts[prev_ids]
+        tot = self.totals[prev_ids].clamp_min(1.0).unsqueeze(-1)
+        return rows / tot
+
+# --- Cache-augmented sliding window eval (GPU-accelerated) ---
 
 def eval_val_cached(
     args: Hyperparameters, base_model: nn.Module, rank: int, world_size: int,
@@ -1545,9 +1573,8 @@ def eval_val_cached(
     total_tokens = val_tokens.numel() - 1
     chunk_size = args.cache_chunk_tokens
     V = args.vocab_size
-    ngram = NGramKNCache(V, max_order=args.cache_max_order, table_bits=args.cache_table_bits)
-    lz = LZExpert(V, min_match=args.lz_min_match, max_match=args.lz_max_match, table_bits=args.lz_table_bits)
-    mixer = ExpertMixer(3, lr=args.expert_lr)
+    alpha = 0.15
+    cache = GPUBigramCache(V, device)
     window_starts = [ws for ws in range(0, total_tokens, stride)
                      if min(ws + seq_len, total_tokens) - ws >= stride or ws == 0]
     num_chunks = (total_tokens + chunk_size - 1) // chunk_size
@@ -1556,18 +1583,15 @@ def eval_val_cached(
         end = min(ws + seq_len, total_tokens)
         wlen = end - ws
         s = 0 if ws == 0 else max(wlen - stride, 0)
-        scored_start = ws + s
-        ci = min(scored_start // chunk_size, num_chunks - 1)
+        ci = min((ws + s) // chunk_size, num_chunks - 1)
         chunk_windows[ci].append(ws)
     loss_sum = torch.zeros((), device=device, dtype=torch.float64)
     token_count = torch.zeros((), device=device, dtype=torch.float64)
     byte_count = torch.zeros((), device=device, dtype=torch.float64)
     base_model.eval()
     compiled_logits = torch.compile(base_model.forward_logits, dynamic=False, fullgraph=True)
-    val_np = val_tokens.numpy().astype(np.int32)
     t0 = time.perf_counter()
-    log0(f"cache_eval:start chunks={num_chunks} chunk_tokens={chunk_size} "
-         f"total_windows={len(window_starts)} stride={stride}")
+    log0(f"cache_eval:start chunks={num_chunks} alpha={alpha} stride={stride}")
     for ci in range(num_chunks):
         windows = chunk_windows[ci]
         if not windows:
@@ -1579,56 +1603,50 @@ def eval_val_cached(
             for bi in range(0, len(my_windows), batch_seqs):
                 batch_ws = my_windows[bi:bi + batch_seqs]
                 bsz = len(batch_ws)
-                x_batch = torch.zeros(bsz, seq_len, dtype=torch.int64, device=device)
-                y_batch = torch.zeros(bsz, seq_len, dtype=torch.int64, device=device)
+                x_b = torch.zeros(bsz, seq_len, dtype=torch.int64, device=device)
+                y_b = torch.zeros(bsz, seq_len, dtype=torch.int64, device=device)
                 wlens: list[int] = []
                 for i, ws in enumerate(batch_ws):
                     end = min(ws + seq_len, total_tokens)
                     wlen = end - ws
                     wlens.append(wlen)
-                    chunk_tok = val_tokens[ws:end + 1].to(dtype=torch.int64, device=device)
-                    x_batch[i, :wlen] = chunk_tok[:-1]
-                    y_batch[i, :wlen] = chunk_tok[1:]
+                    ct = val_tokens[ws:end+1].to(dtype=torch.int64, device=device)
+                    x_b[i, :wlen] = ct[:-1]
+                    y_b[i, :wlen] = ct[1:]
                 with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                    logits = compiled_logits(x_batch)
-                log_probs_neural = F.log_softmax(logits.float(), dim=-1)
+                    logits = compiled_logits(x_b)
+                p_neural = F.softmax(logits.float(), dim=-1)
                 for i, ws in enumerate(batch_ws):
                     wlen = wlens[i]
                     s_off = 0 if ws == 0 else max(wlen - stride, 0)
-                    scored_range = range(s_off, wlen)
-                    n_scored = len(scored_range)
-                    if n_scored == 0:
+                    ns = wlen - s_off
+                    if ns <= 0:
                         continue
-                    x_np = x_batch[i, :wlen].cpu().numpy().astype(np.int32)
-                    y_np = y_batch[i, :wlen].cpu().numpy().astype(np.int32)
-                    tgts = y_np[s_off:wlen]
-                    contexts = [x_np[max(0,j-args.cache_max_order):j+1] for j in range(s_off, wlen)]
-                    ng_p = ngram.predict_batch(contexts, tgts)
-                    lz_p, lz_conf = lz.predict_batch(contexts, tgts)
-                    neural_lp = log_probs_neural[i, s_off:wlen]
-                    neural_p_tgt = torch.exp(neural_lp[torch.arange(n_scored), torch.from_numpy(tgts).long().to(device)]).cpu().numpy().astype(np.float64)
-                    expert_mat = np.stack([neural_p_tgt, ng_p, lz_p], axis=1)
-                    mix_p = mixer.mix_batch(expert_mat)
-                    mix_p = np.maximum(mix_p, 1e-12)
-                    nll = -np.log(mix_p)
-                    mixer.update_batch(expert_mat, tgts)
-                    loss_sum += float(nll.sum())
-                    token_count += float(n_scored)
-                    tgt_t = y_batch[i, s_off:wlen]
-                    prev_t = x_batch[i, s_off:wlen]
-                    tb = base_bytes_lut[tgt_t].to(torch.float64)
-                    tb += (has_leading_space_lut[tgt_t] & ~is_boundary_token_lut[prev_t]).to(torch.float64)
+                    prev = x_b[i, s_off:wlen]
+                    tgt = y_b[i, s_off:wlen]
+                    pn = p_neural[i, s_off:wlen]
+                    conf = (cache.totals[prev] > 5).float() * alpha
+                    if conf.sum() > 0:
+                        pc = cache.predict_full(prev).clamp_min(1e-8)
+                        pc = pc / pc.sum(-1, keepdim=True)
+                        pm = (1.0 - conf.unsqueeze(-1)) * pn + conf.unsqueeze(-1) * pc
+                    else:
+                        pm = pn
+                    pm = pm.clamp_min(1e-10)
+                    nll = -torch.log(pm.gather(1, tgt.unsqueeze(1)).squeeze(1)).to(torch.float64)
+                    loss_sum += nll.sum()
+                    token_count += float(ns)
+                    tb = base_bytes_lut[tgt].to(torch.float64)
+                    tb += (has_leading_space_lut[tgt] & ~is_boundary_token_lut[prev]).to(torch.float64)
                     byte_count += tb.sum()
-        chunk_start = ci * chunk_size
-        chunk_end = min((ci + 1) * chunk_size, total_tokens)
-        scored_toks = val_np[chunk_start:chunk_end]
-        ngram.update(scored_toks)
-        lz.update(scored_toks)
-        if rank == 0 and (ci % 20 == 0 or ci == num_chunks - 1):
-            elapsed = time.perf_counter() - t0
+        cs = ci * chunk_size
+        ce = min(cs + chunk_size, total_tokens)
+        cache.update(val_tokens[cs:ce+1].to(device=device, dtype=torch.int64))
+        if rank == 0 and (ci % 50 == 0 or ci == num_chunks - 1):
+            el = time.perf_counter() - t0
             rl = float(loss_sum.item()) / max(float(token_count.item()), 1)
-            rbpb = rl / math.log(2.0) * (float(token_count.item()) / max(float(byte_count.item()), 1)) if float(token_count.item()) > 0 else 0.0
-            log0(f"  cache_chunk [{ci+1}/{num_chunks}] bpb={rbpb:.6f} w={mixer.w} time={elapsed:.1f}s")
+            rb = rl / math.log(2.0) * (float(token_count.item()) / max(float(byte_count.item()), 1)) if float(token_count.item()) > 0 else 0.0
+            log0(f"  cache [{ci+1}/{num_chunks}] bpb={rb:.6f} time={el:.1f}s")
     if dist.is_available() and dist.is_initialized():
         dist.all_reduce(loss_sum, op=dist.ReduceOp.SUM)
         dist.all_reduce(token_count, op=dist.ReduceOp.SUM)
@@ -1636,11 +1654,10 @@ def eval_val_cached(
     val_loss = (loss_sum / token_count).item()
     val_bpb = val_loss / math.log(2.0) * (token_count.item() / byte_count.item())
     base_model.train()
-    log0(f"cache_eval:done val_loss={val_loss:.6f} val_bpb={val_bpb:.6f} "
-         f"final_weights={mixer.w} elapsed={time.perf_counter() - t0:.1f}s")
+    log0(f"cache_eval:done val_loss={val_loss:.6f} val_bpb={val_bpb:.6f} elapsed={time.perf_counter() - t0:.1f}s")
     return val_loss, val_bpb
 
-# --- Cache-augmented TTT ---
+# --- Cache-augmented TTT (GPU bigram) ---
 
 def eval_val_cached_ttt(
     args: Hyperparameters, base_model: nn.Module, rank: int, world_size: int,
@@ -1652,9 +1669,8 @@ def eval_val_cached_ttt(
     total_tokens = val_tokens.numel() - 1
     ttt_chunk = args.ttt_chunk_tokens
     V = args.vocab_size
-    ngram = NGramKNCache(V, max_order=args.cache_max_order, table_bits=args.cache_table_bits)
-    lz = LZExpert(V, min_match=args.lz_min_match, max_match=args.lz_max_match, table_bits=args.lz_table_bits)
-    mixer = ExpertMixer(3, lr=args.expert_lr)
+    alpha = 0.15
+    cache = GPUBigramCache(V, device)
     window_starts = [ws for ws in range(0, total_tokens, stride)
                      if min(ws + seq_len, total_tokens) - ws >= stride or ws == 0]
     num_chunks = (total_tokens + ttt_chunk - 1) // ttt_chunk
@@ -1663,47 +1679,30 @@ def eval_val_cached_ttt(
         end = min(ws + seq_len, total_tokens)
         wlen = end - ws
         s = 0 if ws == 0 else max(wlen - stride, 0)
-        scored_start = ws + s
-        ci = min(scored_start // ttt_chunk, num_chunks - 1)
+        ci = min((ws + s) // ttt_chunk, num_chunks - 1)
         chunk_windows[ci].append(ws)
-    log0(f"cache_ttt:start chunks={num_chunks} chunk_tokens={ttt_chunk} "
-         f"total_windows={len(window_starts)} stride={stride}")
+    log0(f"cache_ttt:start chunks={num_chunks} alpha={alpha}")
     loss_sum = torch.zeros((), device=device, dtype=torch.float64)
     token_count = torch.zeros((), device=device, dtype=torch.float64)
     byte_count = torch.zeros((), device=device, dtype=torch.float64)
-    has_lora = any(hasattr(b, '_lora') and b._lora is not None for b in base_model.blocks)
-    if has_lora and args.lora_ttt:
-        for p in base_model.parameters():
+    frozen_block_ids = set(range(min(args.ttt_freeze_blocks, len(base_model.blocks))))
+    ttt_params = []
+    for name, p in base_model.named_parameters():
+        freeze = any(f"blocks.{bi}." in name for bi in frozen_block_ids)
+        if freeze or "tok_emb" in name or "bigram" in name or "smear" in name:
             p.requires_grad_(False)
-        ttt_params = []
-        for b in base_model.blocks:
-            if hasattr(b, '_lora') and b._lora is not None:
-                for p in b._lora.parameters():
-                    p.requires_grad_(True)
-                    ttt_params.append(p)
-        log0(f"cache_ttt:lora_only params={sum(p.numel() for p in ttt_params)} "
-             f"frozen_base={sum(p.numel() for p in base_model.parameters() if not p.requires_grad)}")
-    else:
-        frozen_block_ids = set(range(min(args.ttt_freeze_blocks, len(base_model.blocks))))
-        ttt_params = []
-        for name, p in base_model.named_parameters():
-            freeze = any(f"blocks.{bi}." in name for bi in frozen_block_ids)
-            if freeze or "tok_emb" in name or "bigram" in name or "smear" in name:
-                p.requires_grad_(False)
-            else:
-                p.requires_grad_(True)
-                ttt_params.append(p)
-        log0(f"cache_ttt:params unfrozen={sum(p.numel() for p in ttt_params)} "
-             f"frozen={sum(p.numel() for p in base_model.parameters() if not p.requires_grad)}")
+        else:
+            p.requires_grad_(True)
+            ttt_params.append(p)
+    log0(f"cache_ttt:unfrozen={sum(p.numel() for p in ttt_params)}")
     optimizer = torch.optim.SGD(ttt_params, lr=args.ttt_lr, momentum=args.ttt_momentum)
-    val_np = val_tokens.numpy().astype(np.int32)
     t0 = time.perf_counter()
     for ci in range(num_chunks):
         windows = chunk_windows[ci]
         if not windows:
             continue
-        chunk_start = ci * ttt_chunk
-        chunk_end = min((ci + 1) * ttt_chunk, total_tokens)
+        cs = ci * ttt_chunk
+        ce = min(cs + ttt_chunk, total_tokens)
         my_s = (len(windows) * rank) // world_size
         my_e = (len(windows) * (rank + 1)) // world_size
         my_windows = windows[my_s:my_e]
@@ -1712,72 +1711,67 @@ def eval_val_cached_ttt(
             for bi in range(0, len(my_windows), batch_seqs):
                 batch_ws = my_windows[bi:bi + batch_seqs]
                 bsz = len(batch_ws)
-                x_batch = torch.zeros(bsz, seq_len, dtype=torch.int64, device=device)
-                y_batch = torch.zeros(bsz, seq_len, dtype=torch.int64, device=device)
+                x_b = torch.zeros(bsz, seq_len, dtype=torch.int64, device=device)
+                y_b = torch.zeros(bsz, seq_len, dtype=torch.int64, device=device)
                 wlens: list[int] = []
                 for i, ws in enumerate(batch_ws):
                     end = min(ws + seq_len, total_tokens)
                     wlen = end - ws
                     wlens.append(wlen)
-                    chunk_tok = val_tokens[ws:end + 1].to(dtype=torch.int64, device=device)
-                    x_batch[i, :wlen] = chunk_tok[:-1]
-                    y_batch[i, :wlen] = chunk_tok[1:]
+                    ct = val_tokens[ws:end+1].to(dtype=torch.int64, device=device)
+                    x_b[i, :wlen] = ct[:-1]
+                    y_b[i, :wlen] = ct[1:]
                 with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                    logits = base_model.forward_logits(x_batch)
-                log_probs_neural = F.log_softmax(logits.float(), dim=-1)
+                    logits = base_model.forward_logits(x_b)
+                p_neural = F.softmax(logits.float(), dim=-1)
                 for i, ws in enumerate(batch_ws):
                     wlen = wlens[i]
                     s_off = 0 if ws == 0 else max(wlen - stride, 0)
-                    n_scored = wlen - s_off
-                    if n_scored <= 0:
+                    ns = wlen - s_off
+                    if ns <= 0:
                         continue
-                    x_np = x_batch[i, :wlen].cpu().numpy().astype(np.int32)
-                    y_np = y_batch[i, :wlen].cpu().numpy().astype(np.int32)
-                    tgts = y_np[s_off:wlen]
-                    contexts = [x_np[max(0,j-args.cache_max_order):j+1] for j in range(s_off, wlen)]
-                    ng_p = ngram.predict_batch(contexts, tgts)
-                    lz_p, _ = lz.predict_batch(contexts, tgts)
-                    neural_p_tgt = torch.exp(log_probs_neural[i, s_off:wlen][torch.arange(n_scored), torch.from_numpy(tgts).long().to(device)]).cpu().numpy().astype(np.float64)
-                    expert_mat = np.stack([neural_p_tgt, ng_p, lz_p], axis=1)
-                    mix_p = np.maximum(mixer.mix_batch(expert_mat), 1e-12)
-                    nll = -np.log(mix_p)
-                    mixer.update_batch(expert_mat, tgts)
-                    loss_sum += float(nll.sum())
-                    token_count += float(n_scored)
-                    tgt_t = y_batch[i, s_off:wlen]
-                    prev_t = x_batch[i, s_off:wlen]
-                    tb = base_bytes_lut[tgt_t].to(torch.float64)
-                    tb += (has_leading_space_lut[tgt_t] & ~is_boundary_token_lut[prev_t]).to(torch.float64)
+                    prev = x_b[i, s_off:wlen]
+                    tgt = y_b[i, s_off:wlen]
+                    pn = p_neural[i, s_off:wlen]
+                    conf = (cache.totals[prev] > 5).float() * alpha
+                    if conf.sum() > 0:
+                        pc = cache.predict_full(prev).clamp_min(1e-8)
+                        pc = pc / pc.sum(-1, keepdim=True)
+                        pm = (1.0 - conf.unsqueeze(-1)) * pn + conf.unsqueeze(-1) * pc
+                    else:
+                        pm = pn
+                    pm = pm.clamp_min(1e-10)
+                    nll = -torch.log(pm.gather(1, tgt.unsqueeze(1)).squeeze(1)).to(torch.float64)
+                    loss_sum += nll.sum()
+                    token_count += float(ns)
+                    tb = base_bytes_lut[tgt].to(torch.float64)
+                    tb += (has_leading_space_lut[tgt] & ~is_boundary_token_lut[prev]).to(torch.float64)
                     byte_count += tb.sum()
-        scored_toks = val_np[chunk_start:chunk_end]
-        ngram.update(scored_toks)
-        lz.update(scored_toks)
+        cache.update(val_tokens[cs:ce+1].to(device=device, dtype=torch.int64))
         is_last = (ci == num_chunks - 1)
         if not is_last and args.ttt_epochs > 0:
             base_model.train()
-            chunk_seqs = (chunk_end - chunk_start) // seq_len
+            chunk_seqs = (ce - cs) // seq_len
             if chunk_seqs > 0:
                 cos_lr = args.ttt_lr * 0.5 * (1.0 + math.cos(math.pi * ci / max(num_chunks - 1, 1)))
                 for pg in optimizer.param_groups:
                     pg['lr'] = cos_lr
-                my_seq_s = (chunk_seqs * rank) // world_size
-                my_seq_e = (chunk_seqs * (rank + 1)) // world_size
-                my_chunk_seqs = my_seq_e - my_seq_s
+                ms = (chunk_seqs * rank) // world_size
+                me = (chunk_seqs * (rank + 1)) // world_size
                 for _ep in range(args.ttt_epochs):
-                    for bs in range(0, my_chunk_seqs, args.ttt_batch_seqs):
-                        be = min(bs + args.ttt_batch_seqs, my_chunk_seqs)
-                        actual_bs = my_seq_s + bs
-                        start_tok = chunk_start + actual_bs * seq_len
-                        end_tok = chunk_start + (my_seq_s + be) * seq_len + 1
-                        if end_tok > val_tokens.numel():
+                    for bs in range(0, me - ms, args.ttt_batch_seqs):
+                        be = min(bs + args.ttt_batch_seqs, me - ms)
+                        st = cs + (ms + bs) * seq_len
+                        et = cs + (ms + be) * seq_len + 1
+                        if et > val_tokens.numel():
                             continue
-                        local = val_tokens[start_tok:end_tok].to(device=device, dtype=torch.int64)
+                        local = val_tokens[st:et].to(device=device, dtype=torch.int64)
                         x = local[:-1].reshape(-1, seq_len)
                         y = local[1:].reshape(-1, seq_len)
                         optimizer.zero_grad(set_to_none=True)
                         with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                            ttt_loss = base_model(x, y)
-                        ttt_loss.backward()
+                            tl = base_model(x, y)
+                        tl.backward()
                         if world_size > 1:
                             for p in ttt_params:
                                 if p.grad is not None:
@@ -1785,10 +1779,10 @@ def eval_val_cached_ttt(
                         torch.nn.utils.clip_grad_norm_(ttt_params, args.ttt_grad_clip)
                         optimizer.step()
         if rank == 0 and (ci % 10 == 0 or ci == num_chunks - 1):
-            elapsed = time.perf_counter() - t0
+            el = time.perf_counter() - t0
             rl = float(loss_sum.item()) / max(float(token_count.item()), 1)
-            rbpb = rl / math.log(2.0) * (float(token_count.item()) / max(float(byte_count.item()), 1)) if float(token_count.item()) > 0 else 0.0
-            log0(f"  cache_ttt [{ci+1}/{num_chunks}] bpb={rbpb:.6f} w={mixer.w} time={elapsed:.1f}s")
+            rb = rl / math.log(2.0) * (float(token_count.item()) / max(float(byte_count.item()), 1)) if float(token_count.item()) > 0 else 0.0
+            log0(f"  cache_ttt [{ci+1}/{num_chunks}] bpb={rb:.6f} time={el:.1f}s")
     if dist.is_available() and dist.is_initialized():
         dist.all_reduce(loss_sum, op=dist.ReduceOp.SUM)
         dist.all_reduce(token_count, op=dist.ReduceOp.SUM)
@@ -1798,8 +1792,7 @@ def eval_val_cached_ttt(
     for p in base_model.parameters():
         p.requires_grad_(True)
     base_model.eval()
-    log0(f"cache_ttt:done val_loss={val_loss:.6f} val_bpb={val_bpb:.6f} "
-         f"final_weights={mixer.w} elapsed={time.perf_counter() - t0:.1f}s")
+    log0(f"cache_ttt:done val_loss={val_loss:.6f} val_bpb={val_bpb:.6f} elapsed={time.perf_counter() - t0:.1f}s")
     return val_loss, val_bpb
 
 
