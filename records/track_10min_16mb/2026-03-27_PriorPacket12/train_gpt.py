@@ -946,7 +946,7 @@ def main():
     pp_builder = PosteriorPacketBuilder(args.vocab_size, max_order=5, table_bits=18)
     train_stream_pp = TokenStream(args.train_files)
     pp_seen = 0
-    pp_target = min(actual_train_files * 100_000_000, 500_000_000)
+    pp_target = min(actual_train_files * 100_000_000, 50_000_000)
     t_pp = time.perf_counter()
     while pp_seen < pp_target:
         chunk = train_stream_pp.take(min(500000, pp_target - pp_seen))
