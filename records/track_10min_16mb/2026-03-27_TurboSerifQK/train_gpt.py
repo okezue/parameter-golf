@@ -2028,8 +2028,10 @@ def main() -> None:
     with open("final_model.int6.ptz", "rb") as f:
         quant_blob_disk = f.read()
     quant_state = torch.load(io.BytesIO(lzma.decompress(quant_blob_disk)), map_location="cpu")
-    deq_unbanked = dequantize_mixed_int6(quant_state["w"], quant_state["m"],
-                                          {k: v for k, v in unbanked_sd.items() if k not in tsqk_names})
+    non_tsqk_sd = {k: v for k, v in unbanked_sd.items() if k not in tsqk_names}
+    deq_unbanked = dequantize_mixed_int6(quant_state["w"], quant_state["m"], non_tsqk_sd)
+    for name in tsqk_names:
+        deq_unbanked[name] = torch.zeros_like(unbanked_sd[name])
     deq_state = _rebank_state_dict(deq_unbanked, args.num_layers, sd_cpu)
     eval_model = GPT(
         vocab_size=args.vocab_size, num_layers=args.num_layers, model_dim=args.model_dim,
