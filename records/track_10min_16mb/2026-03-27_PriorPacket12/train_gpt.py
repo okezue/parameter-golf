@@ -817,7 +817,7 @@ def eval_val_packet(args, base_model, rank, world_size, device, val_tokens,
     byte_count = torch.zeros((), device=device, dtype=torch.float64)
     base_model.eval()
     compiled_logits = torch.compile(base_model.forward_logits, dynamic=False, fullgraph=True)
-    alpha = 0.5
+    alpha = 0.3
     t0 = time.perf_counter()
     log0(f"packet_eval:start chunks={num_chunks} alpha={alpha}")
     for ci in range(num_chunks):
@@ -855,10 +855,13 @@ def eval_val_packet(args, base_model, rank, world_size, device, val_tokens,
                     pn = p_nn[i, s_off:wlen]
                     prev2 = x_b[i, max(s_off-1,0):wlen-1] if s_off > 0 else None
                     pp = packet_store.predict(prev, prev2_ids=prev2)
+                    pp_top1 = pp.max(dim=-1).values
+                    nn_top1 = pn.max(dim=-1).values
+                    pp_better = (pp_top1 > nn_top1 + 0.05).float()
                     tau_vals = packet_store.bi_tau[prev]
                     online_tot = packet_store.online_bi_tot[prev]
-                    conf = torch.sigmoid((tau_vals + online_tot - 5.0) * 0.2)
-                    a = (alpha * conf).unsqueeze(-1)
+                    has_data = ((tau_vals + online_tot) > 20.0).float()
+                    a = (alpha * pp_better * has_data * pp_top1.clamp(0, 1)).unsqueeze(-1)
                     pm = (1.0 - a) * pn + a * pp
                     pm = pm.clamp_min(1e-10)
                     nll = -torch.log(pm.gather(1, tgt.unsqueeze(1)).squeeze(1)).to(torch.float64)
@@ -943,7 +946,7 @@ def main():
     log0(f"train_loader:dataset:{dataset_dir.name} train_shards:{actual_train_files}")
     log0(f"val_loader:shards pattern={args.val_files} tokens:{val_tokens.numel() - 1}")
     log0("pp:building posterior packets from training data...")
-    pp_builder = PosteriorPacketBuilder(args.vocab_size, max_order=5, table_bits=18)
+    pp_builder = PosteriorPacketBuilder(args.vocab_size, max_order=5, table_bits=16)
     train_stream_pp = TokenStream(args.train_files)
     pp_seen = 0
     pp_target = min(actual_train_files * 100_000_000, 50_000_000)
