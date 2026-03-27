@@ -2497,22 +2497,6 @@ def main() -> None:
             x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
                 loss = model(x, y)
-            if surr_cache is not None and comp_alpha_cur > 0.0:
-                with torch.no_grad():
-                    logits_det = base_model.forward_logits(x).detach()
-                    logits_sc = base_model.logit_softcap * torch.tanh(logits_det / base_model.logit_softcap)
-                    p_n = F.softmax(logits_sc.float().reshape(-1, args.vocab_size), dim=-1)
-                    pf = x.reshape(-1)
-                    br = surr_cache.bi_counts[pf]
-                    bs = surr_cache.bi_totals[pf].clamp_min(1.0).unsqueeze(-1)
-                    p_c = (br / bs).clamp_min(1e-8)
-                    p_c = p_c / p_c.sum(dim=-1, keepdim=True)
-                    al = (comp_alpha_cur * surr_cache.confidence(pf)).unsqueeze(-1)
-                    p_m = (1.0 - al) * p_n + al * p_c
-                    tgt = y.reshape(-1)
-                    w = -torch.log(p_m.clamp_min(1e-10).gather(1, tgt.unsqueeze(1)).squeeze(1))
-                    w = (w / w.mean()).clamp(0.5, 2.0).detach()
-                loss = (F.cross_entropy(logits_sc.reshape(-1, args.vocab_size).float(), y.reshape(-1), reduction='none') * w).mean()
             train_loss += loss.detach()
             (loss * grad_scale).backward()
             if surr_cache is not None:
