@@ -1262,9 +1262,21 @@ def eval_val_sliding_ttt(
          f"frozen={sum(p.numel() for p in base_model.parameters() if not p.requires_grad)}")
 
     optimizer = torch.optim.SGD(ttt_params, lr=args.ttt_lr, momentum=args.ttt_momentum)
+    base_snapshot = {n: p.detach().clone() for n, p in base_model.named_parameters() if p.requires_grad}
+    ttt_reset_every = 200
     t0 = time.perf_counter()
 
     for ci in range(num_chunks):
+        if ci > 0 and ci % ttt_reset_every == 0:
+            with torch.no_grad():
+                for n, p in base_model.named_parameters():
+                    if n in base_snapshot:
+                        p.copy_(base_snapshot[n])
+            for pg in optimizer.param_groups:
+                for p in pg['params']:
+                    if p in optimizer.state:
+                        optimizer.state[p] = {}
+            log0(f"  ttt_reset at chunk {ci}")
         windows = chunk_windows[ci]
         if not windows:
             continue
