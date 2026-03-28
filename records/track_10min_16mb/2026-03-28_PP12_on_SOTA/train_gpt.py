@@ -1053,7 +1053,7 @@ def eval_val_packet(args, base_model, rank, world_size, device, val_tokens,
     seq_len = args.train_seq_len
     total_tokens = val_tokens.numel() - 1
     chunk_size = 32768
-    alpha = 0.2
+    alpha = 0.4
     num_chunks = (total_tokens + chunk_size - 1) // chunk_size
     window_starts = [ws for ws in range(0, total_tokens, stride)
                      if min(ws + seq_len, total_tokens) - ws >= stride or ws == 0]
@@ -1105,11 +1105,11 @@ def eval_val_packet(args, base_model, rank, world_size, device, val_tokens,
                     tgt = yb[i, s_off:wlen]
                     p_nn = pn[i, s_off:wlen]
                     pp = pstore.predict(prev)
-                    pp_top1 = pp.max(dim=-1).values
-                    nn_top1 = p_nn.max(dim=-1).values
-                    pp_better = (pp_top1 > nn_top1 + 0.05).float()
-                    has_data = ((pstore.tau[prev] + pstore.online_tot[prev]) > 20.0).float()
-                    a = (alpha * pp_better * has_data * pp_top1.clamp(0, 1)).unsqueeze(-1)
+                    nn_ent = -(p_nn * torch.log(p_nn + 1e-10)).sum(-1)
+                    unc = (nn_ent / 6.9).clamp(0, 1)
+                    has_data = ((pstore.tau[prev] + pstore.online_tot[prev]) > 10.0).float()
+                    pp_sharp = pp.max(dim=-1).values.clamp(0, 1)
+                    a = (alpha * unc * has_data * (0.3 + 0.7 * pp_sharp)).unsqueeze(-1)
                     pm = ((1.0 - a) * p_nn + a * pp).clamp_min(1e-10)
                     nll = -torch.log(pm.gather(1, tgt.unsqueeze(1)).squeeze(1)).to(torch.float64)
                     loss_sum += nll.sum()
@@ -1595,8 +1595,8 @@ def main() -> None:
     pb = PacketBuilder(args.vocab_size)
     pp_stream = TokenStream(args.train_files)
     pp_seen = 0
-    while pp_seen < 5_000_000:
-        chunk = pp_stream.take(min(500000, 5_000_000 - pp_seen))
+    while pp_seen < 20_000_000:
+        chunk = pp_stream.take(min(500000, 20_000_000 - pp_seen))
         pb.update(chunk.numpy().astype(np.int32))
         pp_seen += chunk.numel()
     pp_prior, pp_tau = pb.build()
