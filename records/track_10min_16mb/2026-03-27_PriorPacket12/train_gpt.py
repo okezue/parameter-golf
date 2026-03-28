@@ -949,7 +949,7 @@ def main():
     pp_builder = PosteriorPacketBuilder(args.vocab_size, max_order=5, table_bits=16)
     train_stream_pp = TokenStream(args.train_files)
     pp_seen = 0
-    pp_target = min(actual_train_files * 100_000_000, 50_000_000)
+    pp_target = min(actual_train_files * 100_000_000, 5_000_000)
     t_pp = time.perf_counter()
     while pp_seen < pp_target:
         chunk = train_stream_pp.take(min(500000, pp_target - pp_seen))
@@ -1148,18 +1148,47 @@ def main():
         torch.save(base_model.state_dict(), "final_model.pt")
         log0(f"Serialized model: {os.path.getsize('final_model.pt')} bytes")
         log0(f"Code size: {len(code.encode('utf-8'))} bytes")
-    # --- Quantize and serialize ---
-    quant_obj = quantize_state_dict_int8(base_model.state_dict())
+    def _quant_int6_row(t):
+        t32 = t.float()
+        if t32.ndim == 2:
+            best_q, best_s, best_err = None, None, float('inf')
+            for pct in [0.9990, 0.9995, 0.9999, 0.99999, 1.0]:
+                rc = torch.quantile(t32.abs(), pct, dim=1) if pct < 1.0 else t32.abs().amax(dim=1)
+                s = (rc / 31.0).clamp_min(1.0 / 31.0).to(torch.float16)
+                q = torch.clamp(torch.round(t32 / s.float()[:, None]), -31, 31).to(torch.int8)
+                err = (t32 - q.float() * s.float()[:, None]).pow(2).mean().item()
+                if err < best_err:
+                    best_q, best_s, best_err = q, s, err
+            return best_q, best_s
+        amax = t32.abs().max().item()
+        s = torch.tensor(amax / 31.0 if amax > 0 else 1.0, dtype=torch.float16)
+        return torch.clamp(torch.round(t32 / s.float()), -31, 31).to(torch.int8), s
+    sd = base_model.state_dict()
+    q_result, q_meta = {}, {}
+    for name, tensor in sd.items():
+        t = tensor.detach().cpu().contiguous()
+        if not t.is_floating_point() or t.numel() <= 65536:
+            q_result[name] = t.to(torch.float16) if t.is_floating_point() else t
+            q_meta[name] = "pass"
+            continue
+        if any(p in name for p in CONTROL_TENSOR_NAME_PATTERNS):
+            q_result[name] = t.float()
+            q_meta[name] = "ctrl"
+            continue
+        q, s = _quant_int6_row(t)
+        q_result[name + ".q"] = q
+        q_result[name + ".s"] = s
+        q_meta[name] = "int6"
     quant_buf = io.BytesIO()
-    torch.save(quant_obj, quant_buf)
+    torch.save({"w": q_result, "m": q_meta}, quant_buf)
     quant_raw = quant_buf.getvalue()
     quant_blob = lzma.compress(quant_raw, preset=6)
     if master_process:
-        with open("final_model.int8.ptz", "wb") as f:
+        with open("final_model.ptz", "wb") as f:
             f.write(quant_blob)
         quant_file_bytes = len(quant_blob)
         code_bytes = len(code.encode("utf-8"))
-        log0(f"Serialized model int8+lzma: {quant_file_bytes} bytes")
+        log0(f"Serialized model int6+lzma: {quant_file_bytes} bytes")
         packet_buf = io.BytesIO()
         torch.save(store_data, packet_buf)
         packet_raw = packet_buf.getvalue()
@@ -1172,11 +1201,24 @@ def main():
         log0(f"Total submission size: {total} bytes (model={quant_file_bytes} code={code_bytes} packets={packet_bytes})")
     if distributed:
         dist.barrier()
-    # --- Load quantized model for eval ---
-    with open("final_model.int8.ptz", "rb") as f:
+    with open("final_model.ptz", "rb") as f:
         quant_blob_disk = f.read()
-    quant_state = torch.load(io.BytesIO(lzma.decompress(quant_blob_disk)), map_location="cpu")
-    base_model.load_state_dict(dequantize_state_dict_int8(quant_state), strict=True)
+    qs = torch.load(io.BytesIO(lzma.decompress(quant_blob_disk)), map_location="cpu")
+    deq = {}
+    for name in sd:
+        info = qs["m"].get(name)
+        if info in ("pass", "ctrl"):
+            t = qs["w"][name]
+            if t.dtype == torch.float16 and sd[name].dtype in (torch.float32, torch.bfloat16):
+                t = t.to(sd[name].dtype)
+            deq[name] = t
+        elif info == "int6":
+            q, s = qs["w"][name + ".q"], qs["w"][name + ".s"]
+            if s.ndim > 0:
+                deq[name] = (q.float() * s.float().view(-1, 1)).to(sd[name].dtype)
+            else:
+                deq[name] = (q.float() * float(s)).to(sd[name].dtype)
+    base_model.load_state_dict(deq, strict=True)
     # --- Sliding window eval ---
     sw_seq_len = effective_eval_seq_len
     if args.eval_stride > 0 and args.eval_stride < sw_seq_len:
